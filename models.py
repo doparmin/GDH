@@ -1,16 +1,53 @@
-#from debug import debug
+from debug import debug
 import torch.nn as nn
 import torch.optim
 
 import torch.nn.functional as F
 
+import segmentation_models_pytorch as smp
+
+
+def get_model(model, in_channels, out_channels):
+    if model == 'Resnet18':
+        return Resnet(in_channels, [64] * 2 + [128] * 2 + [256] * 2 + [512] * 2, out_channels)
+    if model == 'Resnet34':
+        return Resnet(in_channels, [64] * 3 + [128] * 4 + [256] * 6 + [512] * 3, out_channels)
+
+    if model == 'Unet':
+        return Unet(in_channels, [64, 128], out_channels, block_depth=2, bottleneck_depth=2)
+    if model == 'UnetSmp':
+        return smp.Unet(
+            encoder_depth=1,
+            in_channels=in_channels,
+            decoder_channels=(64,),
+            # decoder_channels=(256, 128, 64),
+            classes=out_channels,
+            activation=None,
+        )
+    if model == 'UnetPlusPlus':
+        return smp.UnetPlusPlus(
+            encoder_depth=3,
+            in_channels=in_channels,
+            decoder_channels=(256, 128, 64),
+            classes=out_channels,
+            activation=None,
+        )
+    if model == 'BaselineColorMatrix':
+        return TransferBaselineColorMatrix(in_channels, out_channels)
+    if model == 'BaselineConv':
+        return TransferBaselineConv(in_channels, out_channels)
+
+    raise Exception('invalid model')
+
 
 def conv_block(in_channels, out_channels, stride=1):
     return nn.Sequential(
-        nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
+        nn.Conv2d(in_channels, out_channels, kernel_size=3,
+                  stride=stride, padding=1, bias=False),
         nn.BatchNorm2d(out_channels),
         nn.ReLU(inplace=True),
-        nn.Conv2d(out_channels, out_channels, kernel_size=1, stride=1, bias=False),
+        nn.Conv2d(out_channels, out_channels,
+                  kernel_size=1, stride=1, bias=False),
         nn.BatchNorm2d(out_channels),
     )
 
@@ -24,7 +61,8 @@ class ResBlock(nn.Module):
             self.skip = nn.Identity()
         else:
             self.skip = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.Conv2d(in_channels, out_channels, kernel_size=1,
+                          stride=stride, bias=False),
                 nn.BatchNorm2d(out_channels),
             )
 
@@ -32,12 +70,13 @@ class ResBlock(nn.Module):
         return F.relu(self.block(x) + self.skip(x))
 
 
-class ResNet(nn.Module):
+class Resnet(nn.Module):
     def __init__(self, in_channels, block_features, num_classes=10, linear_head=True):
         super().__init__()
         block_features = [block_features[0]] + block_features
         self.expand = nn.Sequential(
-            nn.Conv2d(in_channels, block_features[0], kernel_size=1, stride=1, bias=False),
+            nn.Conv2d(
+                in_channels, block_features[0], kernel_size=1, stride=1, bias=False),
             nn.BatchNorm2d(block_features[0]),
         )
         self.res_blocks = nn.ModuleList([
@@ -49,47 +88,59 @@ class ResNet(nn.Module):
         if linear_head:
             self.head = nn.Linear(block_features[-1], num_classes)
         else:
-            self.head = nn.Conv2d(block_features[-1], num_classes, kernel_size=3, padding=1)
+            self.head = nn.Conv2d(
+                block_features[-1], num_classes, kernel_size=3, padding=1)
 
     def forward(self, x):
         x = self.expand(x)
         for res_block in self.res_blocks:
             x = res_block(x)
         if self.linear_head:
-            x = F.avg_pool2d(x, x.shape[-1])    # completely reduce spatial dimension
+            # completely reduce spatial dimension
+            x = F.avg_pool2d(x, x.shape[-1])
             x = x.reshape(x.shape[0], -1)
         x = self.head(x)
         return x
 
 
-def resnet18(in_channels, num_classes):
-    block_features = [64] * 2 + [128] * 2 + [256] * 2 + [512] * 2
-    return ResNet(in_channels, block_features, num_classes)
-
-
-def resnet34(in_channels, num_classes):
-    block_features = [64] * 3 + [128] * 4 + [256] * 6 + [512] * 3
-    return ResNet(in_channels, block_features, num_classes)
-
-
 class Unet(nn.Module):
-    def __init__(self, in_channels, down_features, num_classes, pooling=False):
+    def __init__(self, in_channels, down_features, num_classes, block_depth=1, bottleneck_depth=2, pooling=False):
         super().__init__()
-        self.expand = conv_block(in_channels, down_features[0])
+        self.expand = nn.Sequential(
+            nn.Conv2d(
+                in_channels, down_features[0], kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(down_features[0]),
+        )
 
         self.pooling = pooling
 
-        down_stride = 1 if pooling else 2
+        down_stride = 2 if not pooling else 1
+
+        # if pooling:
+        #     self.downs = nn.ModuleList([
+        #         nn.Sequential(*[conv_block(ins, outs, stride=2 if i == block_repeat else 1)
+        #                         for i in range(block_repeat)])
+        #         for ins, outs in zip(down_features, down_features[1:])
+        #     ])
+
         self.downs = nn.ModuleList([
-            conv_block(ins, outs, stride=down_stride) for ins, outs in zip(down_features, down_features[1:])])
+            nn.Sequential(*[conv_block(ins, outs if i == block_depth - 1 else ins, stride=down_stride if i == block_depth - 1 else 1)
+                            for i in range(block_depth)])
+            for ins, outs in zip(down_features, down_features[1:])])
+
+        self.bottleneck = nn.Sequential(
+            *[ResBlock(down_features[-1], down_features[-1]) for i in range(bottleneck_depth)])
 
         up_features = down_features[::-1]
         self.ups = nn.ModuleList([
-            conv_block(ins + outs, outs) for ins, outs in zip(up_features, up_features[1:])])
+            nn.Sequential(*[conv_block(ins + outs if i == 0 else outs, outs)
+                            for i in range(block_depth)])
+            for ins, outs in zip(up_features, up_features[1:])])
 
         self.head = nn.Conv2d(down_features[0], num_classes, kernel_size=1)
 
-        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.upsample = nn.Upsample(
+            scale_factor=2, mode='bilinear', align_corners=False)
 
     def forward(self, x):
         x = self.expand(x)
@@ -101,6 +152,8 @@ class Unet(nn.Module):
             x = down(x)
             if self.pooling:
                 x = F.max_pool2d(x, 2)
+
+        x = self.bottleneck(x)
 
         for up, x_skip in zip(self.ups, reversed(x_skips)):
             x = torch.cat([self.upsample(x), x_skip], dim=1)
@@ -139,7 +192,7 @@ class DistortionModelConv(nn.Module):
 
         self.noise.data *= lambd
 
-    @torch.no_grad()
+    @ torch.no_grad()
     def forward(self, inputs):
         outputs = inputs
         outputs = outputs + self.noise
@@ -148,12 +201,67 @@ class DistortionModelConv(nn.Module):
         return outputs
 
 
-if __name__ == '__main__':
-    net = Unet(3, [64, 128], 3)
-    # from utils import get_layers
-    # conv_layers = get_layers(net, nn.Conv2d)
-    from debug import debug
+class TransferBaselineColorMatrix(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
 
-    x = torch.randn((8, 3, 32, 32))
-    y = net(x)
-    debug(y)
+        self.color_matrix = nn.Conv2d(
+            in_channels, out_channels, kernel_size=1, padding=1)
+        # self.color_matrix.weight.data = torch.eye(3).reshape(3, 3, 1, 1)
+        # self.color_matrix.bias.data = torch.zeros(3)
+
+        self.bn = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+
+        x = self.color_matrix(x)
+        x = self.bn(x)
+
+        return x
+
+
+class TransferBaselineConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, in_channels,
+                               kernel_size=5, padding=2)
+        self.conv2 = nn.Conv2d(in_channels, out_channels,
+                               kernel_size=3, padding=1)
+
+    def forward(self, x):
+
+        x = self.conv1(x)
+        x = self.conv2(x)
+
+        return x
+
+
+if __name__ == '__main__':
+    from datasets import get_dataset
+
+    dataset = get_dataset('Cytomorphology')
+
+    x = dataset[0][0].unsqueeze(0)
+
+    import matplotlib.pyplot as plt
+    # import torchvision.utils
+    from torchvision.utils import make_grid
+
+    plt.imshow(make_grid(x, normalize=True).permute(1, 2, 0))
+
+    model = TransferBaselineColorMatrix(3, 3)
+    print(model.color_matrix.weight.shape)
+    x = model(x)
+    plt.imshow(make_grid(x, normalize=True).permute(1, 2, 0))
+
+    # net = Unet(3, [64, 128], 3, block_depth=2, bottleneck_depth=2)
+    # # from utils import get_layers
+    # # conv_layers = get_layers(net, nn.Conv2d)
+    # from debug import debug
+
+    # debug(net)
+
+    # x = torch.randn((8, 3, 32, 32))
+    # y = net(x)
+    # debug(y)

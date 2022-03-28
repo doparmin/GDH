@@ -1,3 +1,5 @@
+import torch.nn.functional as F
+from debug import debug
 import tarfile
 import gdown
 from copy import copy
@@ -21,27 +23,86 @@ import tifffile as tiff
 import importlib
 import debug
 importlib.reload(debug)
-from debug import debug
 
 
 IMAGE_FILE_TYPES = ['jpg', 'png', 'tif', 'tiff', 'pt']
 os.makedirs('data', exist_ok=True)
 
+INVALID_CLASS = '__INVALID__'
+
+EQUIVALENCE_CLASSES = {
+    'BAS': 'basophil',
+    'EBO': 'erythroblast',
+    'EOS': 'eosinophil',
+    'KSC': INVALID_CLASS,
+    'LYA': 'lymphocyte',
+    'LYT': 'lymphocyte',
+    'MMZ': 'ig',
+    'MOB': 'monocyte',
+    'MON': 'monocyte',
+    'MYB': 'ig',
+    'MYO': 'ig',
+    'NGB': 'neutrophil',
+    'NGS': 'neutrophil',
+    'PMB': 'ig',
+    'PMO': 'ig',
+}
+
+EQUIVALENCE_CLASSES_2 = {
+    #equivalence classes when using the more differentiated PBC dataset
+    'BAS': 'basophil',
+    'EBO': 'erythroblast',
+    'EOS': 'eosinophil',
+    'KSC': INVALID_CLASS,
+    'LYA': INVALID_CLASS,
+    'LYT': 'lymphocyte',
+    'MMZ': 'metamyelocyte',
+    'MOB': 'monocyte',
+    'MON': 'monocyte',
+    'MYB': 'myelocyte',
+    'MYO': INVALID_CLASS,
+    'NGB': 'neutrophil_banded',
+    'NGS': 'neutrophil_segmented',
+    'PMB': INVALID_CLASS,
+    'PMO': 'promyelocyte'
+}
+
+#explaination:
+#Cytomorphology Class:
+    #'BAS': 'basophil',
+    #'EBO': 'erythroblast',
+    #'EOS': 'eosinophil',
+    #'KSC': 'smudge cells,
+    #'LYA': 'atypical lymphocytes',
+    #'LYT': 'lymphocyte',
+    #'MMZ': 'metamyelocyte',
+    #'MOB': 'monoblast',
+    #'MON': 'monocyte',
+    #'MYB': 'myelocyte',
+    #'MYO': 'myeloblast',
+    #'NGB': 'neutrophil_banded',
+    #'NGS': 'neutrophil_segmented',
+    #'PMB': 'promyelocyte_bilobed',
+    #'PMO': 'promyelocyte',
+
 
 def get_dataset(dataset, train_augmentation=False):
     if dataset == 'PBCBarcelona':
         return PBCBarcelona()
-    if dataset == 'PBCBarcelona_2x':
+    if dataset == 'PBCBarcelona-2x':
         return PBCBarcelona(reduce=2)
-    if dataset == 'PBCBarcelona_4x':
+    if dataset == 'PBCBarcelona-4x':
         return PBCBarcelona(reduce=4)
 
     if dataset == 'Cytomorphology':
         return Cytomorphology()
-    if dataset == 'Cytomorphology_2x':
+    if dataset == 'Cytomorphology-2x':
         return Cytomorphology(reduce=2)
-    if dataset == 'Cytomorphology_4x':
+    if dataset == 'Cytomorphology-4x':
         return Cytomorphology(reduce=4)
+
+    if dataset == 'Cytomorphology-4x-PBC':
+        return CytomorphologyPBC(reduce=4)
 
     if dataset == 'MNIST':
         return MNISTWrapper(train_augmentation)
@@ -52,7 +113,7 @@ def get_dataset(dataset, train_augmentation=False):
     elif dataset == 'CIFAR10Distorted':
         return CIFAR10Distorted(train_augmentation)
 
-    raise 'invalid dataset'
+    raise Exception(f"invalid dataset '{dataset}'")
 
 
 class TorchDatasetWrapper():
@@ -88,7 +149,7 @@ class TorchDatasetWrapper():
 
         labels = train_set.labels if hasattr(
             train_set, 'labels') else train_set.targets
-        self.classes = list(set([label.item() if isinstance(
+        self.classes = sorted(set([label.item() if isinstance(
             label, torch.Tensor) else label for label in labels]))
         self.input_shape = self.train_set[0][0].shape
         self.in_channels = self.input_shape[0]
@@ -149,16 +210,16 @@ class ImageFolderDataset(Dataset):
         self.img_dir = img_dir
         self.images = list_images_in_dir(img_dir, recursive=True)
 
-        self.labels = labels
-
         if labels is None:
             assert folder_labels, 'No labels provided and not using folder labels.'
-            self.labels = [img.split('/')[-2] for img in self.images]
+            self.class_labels = [img.split('/')[-2] for img in self.images]
+        else:
+            self.class_labels = labels
 
-        assert len(self.images) == len(self.labels)
+        assert len(self.images) == len(self.class_labels)
 
-        self.classes = list(set(self.labels))
-        self.labels = [self.classes.index(label) for label in self.labels]
+        self.classes = sorted(set(self.class_labels))
+        self.labels = [self.classes.index(clss) for clss in self.class_labels]
         self.num_classes = len(self.classes)
 
         self.transform = transform
@@ -258,31 +319,7 @@ class CIFAR10Distorted(ImageFolderDataset):  # , CIFAR10Wrapper):
         self.test_set.transform = self.transform
 
 
-# ig: MMZ, MYB, MYO, PMB, PMO
-# eosinophil: EOS
-# erythroblast: EBO
-# basophil: BAS
-# lymphocyte: LYT, LYA
-# monocyte: MON
-# neutrophil: NGB, NGS
-# platelet:
-
-# BAS Basophil: basophil
-# EBO Erythroblast: erythroblast
-# EOS Eosinophil: eosinophil
-# KSC Smudge cell
-# LYA Lymphocyte (atypical): lymphocyte
-# LYT Lymphocyte (typical): lymphocyte
-# MMZ Metamyelocyte: ig
-# MOB Monoblast:
-# MON Monocyte: monocyte
-# MYB Myelocyte: ig
-# MYO Myeloblast: ig
-# NGB Neutrophil (band): neutrophil
-# NGS Neutrophil (segmented): neutrophil
-# PMB Promyelocyte (bilobled): ig
-# PMO Promyelocyte: ig
-
+# https://wiki.cancerimagingarchive.net/pages/viewpage.action?pageId=61080958
 class Cytomorphology(ImageFolderDataset):
 
     def __init__(self, transform=None, reduce=1):
@@ -293,7 +330,6 @@ class Cytomorphology(ImageFolderDataset):
             download_Cytomorphology_dataset()
 
         transform = T.Compose([T.ToTensor(),
-                               # XXX: center cropping to get same dimensions as PBC dataset
                                T.CenterCrop(360),
                                T.Resize((360 // reduce, 360 // reduce)),
                                T.Normalize(mean=[0.8092, 0.7088, 0.8340],
@@ -307,6 +343,36 @@ class Cytomorphology(ImageFolderDataset):
             self, [0.7, 0.15, 0.15], seed=0)
 
 
+class CytomorphologyPBC(Cytomorphology):
+    def __init__(self, transform=None, reduce=1):
+        super().__init__(transform, reduce)
+
+        # self.class_labels = [
+        #     EQUIVALENCE_CLASSES[clss]
+        #     for clss in self.class_labels
+        #     if clss in EQUIVALENCE_CLASSES
+        # ]
+        self.images, self.class_labels = list(zip(*[
+            (image, EQUIVALENCE_CLASSES[clss])
+            for image, clss in zip(self.images, self.class_labels)
+            if clss in EQUIVALENCE_CLASSES
+            and EQUIVALENCE_CLASSES[clss] != INVALID_CLASS
+        ]))
+
+        self.classes = sorted(set(self.class_labels))
+        self.labels = [self.classes.index(clss) for clss in self.class_labels]
+        self.num_classes = len(self.classes)
+
+        self.full_set = self
+        self.train_set, self.valid_set, self.test_set = random_split_frac(
+            self, [0.7, 0.15, 0.15], seed=0)
+
+        # print('len images', len(self.images))
+        # print('len clss labels', len(self.class_labels))
+        # print('len labels', len(self.labels))
+
+
+# https://data.mendeley.com/datasets/snkd93bnjr/1
 class PBCBarcelona(ImageFolderDataset):
 
     def __init__(self, transform=None, reduce=1):
@@ -406,8 +472,8 @@ def create_distorted_dataset(dataset, folder_out='auto', strength=0.1, batch_siz
 
 
 def random_split_frac(dataset, fracs, seed=None):
-    if seed is not None:
-        torch.manual_seed(seed)
+    # if seed is not None:
+    #     torch.manual_seed(seed)
     lengths = [int(len(dataset) * frac) for frac in fracs]
     lengths[-1] = len(dataset) - sum(lengths[:-1])
 
@@ -437,7 +503,8 @@ def list_images_in_dir(path, recursive=False):
               if image.split('.')[-1].lower() in IMAGE_FILE_TYPES
               and image.split('/')[-1][0] != '.']
     if recursive:
-        folders = [folder for folder in files if os.path.isdir(folder)]
+        folders = [folder for folder in files
+                   if os.path.isdir(folder) and not folder.split('/')[-1].startswith('.')]
         return images + sum([list_images_in_dir(folder, recursive=recursive) for folder in folders], [])
     return images
 
@@ -472,7 +539,7 @@ def download_Cytomorphology_dataset():
     if not os.path.exists('data/Cytomorphology'):
         print('Extracting..')
         with tarfile.open(tar_file, 'r:gz') as tar:
-            tar.extractall('data/Cytomotphology')
+            tar.extractall('data/Cytomorphology')
     # os.rename('data/PBC_Barcelona_archive/PBC_dataset_normal_DIB/PBC_dataset_normal_DIB',
     #           'data/PBC_Barcelona')
     # shutil.rmtree('data/PBC_Barcelona_archive')
@@ -492,75 +559,157 @@ def download_PBCBarcelona_dataset():
     shutil.rmtree('data/PBC_Barcelona_archive')
 
 
-# def k_fold(dataset, n_splits: int, seed: int, train_size: float):
-#     """Split dataset in subsets for cross-validation
-
-#        Args:
-#             dataset (class): dataset to split
-#             n_split (int): Number of re-shuffling & splitting iterations.
-#             seed (int): seed for k_fold splitting
-#             train_size (float): should be between 0.0 and 1.0 and represent the proportion of the dataset to include in the train split.
-#        Returns:
-#            idxs (list): indeces for splitting the dataset. The list contain n_split pair of train/test indeces.
-#     """
-#     if hasattr(dataset, 'labels'):
-#         x = dataset.images
-#         y = dataset.labels
-#     elif hasattr(dataset, 'masks'):
-#         x = dataset.images
-#         y = dataset.masks
-
-#     sss = StratifiedShuffleSplit(n_splits=n_splits, train_size=train_size, random_state=seed)
-
-#     idxs = []
-
-#     for idxs_train, idxs_test in sss.split(x, y):
-#         idxs.append((idxs_train.tolist(), idxs_test.tolist()))
-
-#     return idxs
+def identity_map(x):
+    return x
 
 
-if __name__ == '__main__':
+def get_transfer_mapping_labels(from_classes, to_classes):
 
-    from utils import calculate_mean_and_std
+    if (set(from_classes) == set(to_classes)):   # equal sets, return identity mapping
+        return {label: {from_classes.index(clss_to)} for label, clss_to in enumerate(to_classes)}
+
+    # assume from_classes < to_classes: unique mapping exists
+    transfer_map = {label: {from_classes.index(EQUIVALENCE_CLASSES[clss_to])}
+                    if clss_to in EQUIVALENCE_CLASSES and EQUIVALENCE_CLASSES[clss_to] != INVALID_CLASS else set()
+                    for label, clss_to in enumerate(to_classes)}
+
+    # if len({*transfer_map.values()}) > 1:
+    if len(set().union(*transfer_map.values())) > 1:
+        return transfer_map
+
+    # from_classes > to_classes
+    transfer_map = {label: {i for i, clss_from in enumerate(from_classes)
+                            if EQUIVALENCE_CLASSES[clss_from] == clss_to}
+                    for label, clss_to in enumerate(to_classes)}
+
+    assert len(set().union(*transfer_map.values())
+               ) > 1, 'error in equivalence classes'
+
+    return transfer_map
+
+
+def get_transfer_mapping_classes(from_classes, to_classes):
+
+    transfer_map = get_transfer_mapping_labels(from_classes, to_classes)
+
+    transfer_map_classes = {to_classes[k]: {from_classes[v] for v in values}
+                            for k, values in transfer_map.items()}
+    return transfer_map_classes
+
+
+class CrossEntropyTransfer():
+    def __init__(self, from_classes, to_classes):
+        # mask true labels from 'to class' that don't have corresponding pre-image in 'from class'
+        # since the model has never seen this / does not have the expressivity (index) to even learn this
+
+        # if from_classes < (subset) to_classes, this is easy: transform to_classes -> from_classes
+        # if from_classes > to_classes, equally boost corresponding from_classes with averaged weight
+
+        self.transfer_map = get_transfer_mapping_labels(
+            from_classes, to_classes)
+
+        self.unique_mapping = len(
+            [v for v in self.transfer_map.values() if len(v) == 1]) == len(self.transfer_map)
+
+    def __call__(self, x, y):
+        labels = y.tolist()
+        mask = [len(self.transfer_map[label]) > 0 for label in labels]
+        labels = [l for l, m in zip(labels, mask) if m]
+        x = x[mask]
+
+        if self.unique_mapping:  # from_classes < to_classes; simply map labels
+            y = torch.LongTensor([list(self.transfer_map[l])[0]
+                                  for l, m in zip(labels, mask) if m]).to(x.device)
+            loss = -1 * F.log_softmax(x, 1).gather(1, y.unsqueeze(1))
+        else:   # from_classes > to_classes
+            y = torch.zeros_like(x)
+
+            for i in range(len(labels)):
+                targets = list(self.transfer_map[labels[i]])
+                y[i, targets] = 1 / len(targets)
+
+            loss = -1 * F.log_softmax(x, 1) * y
+        return loss.mean()
+
+
+# if __name__ == '__main__':
+
+    # dataset_from = get_dataset('Cytomorphology_4x')
+    # dataset_to = get_dataset('PBCBarcelona_4x')
+
+    # from_classes = dataset_from.classes
+    # to_classes = dataset_to.classes
+
+    # N = 5
+    # torch.manual_seed(4)
+
+    # # from_classes, to_classes = to_classes, from_classes
+    # loss_fn = CrossEntropyTransfer(from_classes, to_classes)
+    # transfer_map = loss_fn.transfer_map
+
+    # N = 16
+    # x = torch.randint(0, len(from_classes), (N, ))
+    # y = torch.randint(0, len(to_classes), (N, ))
+
+    # transfer_map, _ = get_transfer_mapping_labels(from_classes, to_classes)
+    # # print(f'Transfer map: {transfer_map}')
+    # print(
+    #     f'Transfer map: {get_transfer_mapping_classes(from_classes, to_classes)}')
+    # for true_label, pred in zip(y.tolist(), x.tolist()):
+    #     print('(prediction)', from_classes[pred], 'in',
+    #           f'{ {from_classes[v] for v in transfer_map[true_label]} } <= {to_classes[true_label]}', '(true_label): ',  pred in transfer_map[true_label])
+
+    # correct = [pred in transfer_map[true_label]
+    #            for true_label, pred in zip(y.tolist(), x.tolist())
+    #            if len(transfer_map[true_label]) > 0]
+
+    # print(f'{sum(correct)} / {len(correct)}')
+
+    # print(sum(correct) / len(correct))
+
+    # from utils import accuracy
+    # print(accuracy(x, y, loss_fn.transfer_map))
+
+if __name__ == "__main__":
     import matplotlib.pyplot as plt
-    dataset = get_dataset('Cytomorphology_4x')
-    train_loader = DataLoader(dataset.train_set, batch_size=64)
+    from torchvision.utils import make_grid
+    import torchvision.transforms.functional as F
+    from debug import debug
 
-    # for i, (img, label) in enumerate(dataset):
-    #     debug(img)
-    #     plt.imshow(img.permute(1, 2, 0)[..., :3])
-    #     plt.title(f'label {label}, class {dataset.classes[label]}')
-    #     plt.show()
-    #     if i == 4:
-    #         break
-    calculate_mean_and_std(train_loader)
+    torch.manual_seed(4)
+    np.random.seed(0)
 
-# if __name__ == "__main__":
-#     import matplotlib.pyplot as plt
-#     from torchvision.utils import make_grid
-#     import torchvision.transforms.functional as F
+    dataset = get_dataset('PBCBarcelona-4x')
+    # dataset = get_dataset('Cytomorphology-4x')
 
-#     torch.manual_seed(0)
-#     np.random.seed(0)
+    # img_dir = 'data/CIFAR10_distorted_1e-01'
+    # dataset = ImageFolderDataset(img_dir=img_dir, folder_labels=True)
+    # debug(dataset)
 
-#     dataset = get_dataset('CIFAR10Distorted')
+    train_loader = DataLoader(
+        dataset.train_set, batch_size=64, shuffle=True, num_workers=16)
+    valid_loader = DataLoader(
+        dataset.valid_set, batch_size=64, shuffle=False, num_workers=16)
+    test_loader = DataLoader(
+        dataset.test_set, batch_size=64, shuffle=False, num_workers=16)
 
-#     # img_dir = 'data/CIFAR10_distorted_1e-01'
-#     # dataset = ImageFolderDataset(img_dir=img_dir, folder_labels=True)
-#     debug(dataset)
+    # # dataset = get_dataset('CIFAR10Distorted')
+    # # loader = DataLoader(dataset.train_set, batch_size=32)
 
-#     # dataset = get_dataset('CIFAR10Distorted')
-#     # loader = DataLoader(dataset.train_set, batch_size=32)
+    # labels = sum(
+    #     [label_batch.tolist() for batch, label_batch in test_loader], [])
 
-#     # for x, y in loader:
-#     #     x = dataset.unnormalize(x)
+    # print(labels)
+    # # debug(labels)
 
-#     #     plt.imshow(make_grid(x, normalize=True).permute(1, 2, 0))
-#     #     plt.show()
+    for x, y in train_loader:
+        # x = dataset.unnormalize(x)
 
-#     #     plt.imshow(make_grid(T.ColorJitter(brightness=.1, hue=.15)(x), normalize=True).permute(1, 2, 0))
-#     #     # plt.imshow(make_grid(F.adjust_sharpness(x, 0.45), normalize=True).permute(1, 2, 0))
-#     #     plt.show()
+        plt.imshow(make_grid(x, normalize=True).permute(1, 2, 0))
+        plt.show()
 
-#     #     break
+        # plt.imshow(make_grid(T.ColorJitter(brightness=.1, hue=.15)(x), normalize=True).permute(1, 2, 0))
+        # plt.imshow(make_grid(F.adjust_sharpness(x, 0.45), normalize=True).permute(1, 2, 0))
+        # plt.show()
+
+        break

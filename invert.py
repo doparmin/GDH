@@ -1,3 +1,4 @@
+import json
 from collections import defaultdict
 import os
 import shutil
@@ -15,32 +16,41 @@ from torchvision.utils import make_grid, save_image
 
 import argparse
 
-os.makedirs('transfer_models', exist_ok=True)
-
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--model', default='models/model.ckpt', help='Model checkpoint for saving/loading.')
-parser.add_argument('--ckpt', default='auto', help='Model checkpoint for saving/loading.')
+parser.add_argument('--model', default='models/model.ckpt',
+                    help='Model checkpoint for saving/loading.')
 
-parser.add_argument('--cuda', action='store_true')
-parser.add_argument('--num_epochs', type=int, default=3, help='Number of training epochs.')
-parser.add_argument('--lr', type=float, default=0.1, help='learning rate')
-parser.add_argument('--batch_size', type=int, default=256, help='batch size')
-parser.add_argument('--f_stats', type=float, default=0.01, help='stats multiplier')
-parser.add_argument('--f_reg', type=float, default=0, help='regularization multiplier')
+parser.add_argument('--num_epochs', type=int, default=3,
+                    help='Number of training epochs.')
+parser.add_argument('--lr', type=float, default=0.1, help='Learning rate')
+parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
+parser.add_argument('--f_stats', type=float,
+                    default=1e-2, help='Stats multiplier')
+parser.add_argument('--f_reg', type=float, default=0,
+                    help='Regularization multiplier')
 
-parser.add_argument('--unsupervised', action='store_true', help='Don\'t use label information.')
+parser.add_argument('--unsupervised', action='store_true',
+                    help='Don\'t use label information.')
 
-parser.add_argument('--resume_training', action='store_true')
+parser.add_argument('--device', default='cuda')
 parser.add_argument('--reset', action='store_true')
-parser.add_argument('--save_best', action='store_true', help='Save only the best models (measured in valid accuracy).')
+parser.add_argument('--save_best', action='store_true',
+                    help='Save only the best models (measured in valid accuracy).')
+
+parser.add_argument('--save_loc', default='auto',
+                    help='Location for saving/loading.')
+parser.add_argument('--experiment', type=str, help='Experiment name')
 args = parser.parse_args()
 
-device = 'cuda'  # if args.cuda else 'cpu'
+device = args.device
 
-if args.ckpt == 'auto':
-    save_loc = args.model.replace('.ckpt', f'_lr={args.lr:1.0e}_f-st={args.f_stats:1.0e}_f-reg={args.f_reg:1.0e}')
+if args.save_loc == 'auto':
+    save_loc = args.model.replace(
+        '.ckpt', ('_unsupervised' if args.unsupervised else '') + f'_lr={args.lr:1.0e}_f-st={args.f_stats:1.0e}_f-reg={args.f_reg:1.0e}')
     save_loc = save_loc.replace('models', 'invert')
+else:
+    save_loc = args.save_loc
 
 if os.path.exists(save_loc) and args.reset:
     shutil.rmtree(save_loc)
@@ -58,8 +68,13 @@ def log(msg):
         f.write(msg + '\n')
 
 
-log('\n' + '\n'.join(f'{k}={v}' for k, v in vars(args).items()) + '\n')
+log(json.dumps(vars(args)))
 
+
+args_log = '\n'.join(f'{k}={v}' for k, v in vars(args).items())
+log(args_log + '\n')
+
+torch.manual_seed(4)
 
 classifier_state_dict = torch.load(args.model, map_location=device)
 classifier = classifier_state_dict['model']
@@ -112,7 +127,7 @@ for l, layer in enumerate(bn_layers):
 
 
 def normalize(x):
-    return x.mean(dim=[0, 2, 3]).norm() + (1 - x.var(dim=[0, 2, 3])).norm()
+    return x.mean(dim=[0, 2, 3]).norm() + (1 - x.std(dim=[0, 2, 3])).norm()
 
 
 def total_variation(x):
@@ -131,59 +146,62 @@ def jitter(x):
 
 _zero = torch.zeros([1], device=device)
 
-if not os.path.exists(inputs_ckpt) or args.resume_training or args.reset:
+log(f'Inverting inputs for {args.model}')
 
-    log(f'Inverting inputs for {args.model}')
+classifier.eval()
 
-    classifier.eval()
+x_original = x
 
-    x_original = x
+for epoch in range(init_epoch, args.num_epochs):
 
-    for epoch in range(init_epoch, init_epoch + args.num_epochs):
+    x = jitter(x_original)
 
-        x = jitter(x_original)
+    logits = classifier(x)
 
-        logits = classifier(x)
+    loss_crit = loss_fn(logits, y)
+    loss_bn = args.f_stats * sum(bn_losses) if args.f_stats != 0 else _zero
+    loss_reg = args.f_reg * \
+        (normalize(x) + total_variation(x)) if args.f_reg != 0 else _zero
 
-        loss_crit = loss_fn(logits, y)
-        loss_bn = args.f_stats * sum(bn_losses) if args.f_stats != 0 else _zero
-        loss_reg = args.f_reg * (normalize(x) + total_variation(x)) if args.f_reg != 0 else _zero
+    loss = loss_bn + loss_reg
 
-        loss = loss_bn + loss_reg
+    acc = (logits.argmax(dim=1) == y).float().mean().item()
 
-        acc = (logits.argmax(dim=1) == y).float().mean().item()
+    metrics = {'acc': acc, 'loss_bn': loss_bn.item(),
+               'loss_reg': loss_reg.item()}
 
-        metrics = {'acc': acc, 'loss_bn': loss_bn.item(), 'loss_reg': loss_reg.item()}
+    if not args.unsupervised:
+        loss += loss_crit
+        metrics['loss_crit'] = loss_crit.item()
 
-        if not args.unsupervised:
-            loss += loss_crit
-            metrics['loss_crit'] = loss_crit.item()
+    for m, v in metrics.items():
+        logs[m].append(v)
 
-        for m, v in metrics.items():
-            logs[m].append(v)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    x = x_original
 
-        x = x_original
+    if (epoch + 1) % 10 == 0:
+        log(f'[{epoch}/{args.num_epochs}] ' +
+            ', '.join([f'{k} {v:.3f}' for k, v in metrics.items()]))
 
-        log(f'[{epoch}/{init_epoch + args.num_epochs}] ' + ', '.join([f'{k} {v:.3f}' for k, v in metrics.items()]))
+    if acc > best_acc:
+        best_acc = acc
+        save_image(make_grid(x[:64].cpu(), normalize=True,
+                             scale_each=True), f'{save_loc}/sample_best.png')
 
-        if acc > best_acc:
-            best_acc = acc
-            save_image(make_grid(x[:64].cpu(), normalize=True, scale_each=True), f'{save_loc}/sample_best.png')
+    if (epoch + 1) % 100 == 0:
+        pretty_plot(logs, smoothing=50, save_loc=plot_loc)
 
-        if (epoch + 1) % 100 == 0:
-            pretty_plot(logs, smoothing=50, save_loc=plot_loc)
+        log(f'Saving inputs to {inputs_ckpt}')
+        torch.save({'inputs': (x, y), 'optimizer': optimizer, 'epoch': epoch + 1,
+                    'acc': best_acc, 'logs': logs}, inputs_ckpt)
 
-            log(f'Saving inputs to {inputs_ckpt}')
-            torch.save({'inputs': (x, y), 'optimizer': optimizer, 'epoch': epoch + 1,
-                       'acc': best_acc, 'logs': logs}, inputs_ckpt)
-
-        if (epoch + 1) % 500 == 0:
-            save_image(make_grid(x[:64].cpu(), normalize=True, scale_each=True),
-                       f'{save_loc}/sample_{epoch + 1:02d}.png')
+    if (epoch + 1) % 500 == 0:
+        save_image(make_grid(x[:64].cpu(), normalize=True, scale_each=True),
+                   f'{save_loc}/sample_{epoch + 1:02d}.png')
 
 
 pretty_plot(logs, smoothing=50)

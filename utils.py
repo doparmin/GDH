@@ -3,14 +3,34 @@ import matplotlib.pyplot as plt
 import torch
 from torch import nn
 import torch.nn.functional as F
+from itertools import product
+# from datasets import equivalence_classes
 
 
 def num_params(model):
     return sum([p.numel() for p in model.parameters() if p.requires_grad])
 
 
+def labels_correct(y_pred, y, transfer_map=None):
+    if transfer_map is None:
+        return (y_pred == y).tolist()
+    y_mapped = [transfer_map[yi] for yi in y.tolist()]
+    return [pred in mapped
+            for mapped, pred in zip(y_mapped, y_pred.tolist())
+            if len(mapped) > 0]
+
+
+def accuracy(y_pred, y, transfer_map=None):
+    if transfer_map is None:
+        return (y_pred == y).float().mean().item()
+    correct = [pred in transfer_map[true_label]
+               for true_label, pred in zip(y.tolist(), y_pred.tolist())
+               if len(transfer_map[true_label]) > 0]
+    return sum(correct) / len(correct) if len(correct) > 0 else 0
+
+
 @torch.no_grad()
-def test_accuracy(model, data_loader, transform=None, name='test', device='cuda'):
+def test_accuracy(model, data_loader, transform=None, transfer_map=None, name=None, device='cuda'):
     num_total = 0
     num_correct = 0
     model.eval()
@@ -20,9 +40,34 @@ def test_accuracy(model, data_loader, transform=None, name='test', device='cuda'
         if transform is not None:
             x = transform(x)
         out = model(x)
-        num_correct += (out.argmax(dim=1) == y).sum().item()
-        num_total += len(x)
-    acc = num_correct / num_total
+        predictions = out.argmax(dim=1)
+        correct = labels_correct(predictions, y, transfer_map=transfer_map)
+        num_correct += sum(correct)
+        num_total += len(correct)
+
+    acc = num_correct / num_total if num_total > 0 else 0   # this shouldn't happen
+    if name is not None:
+        print(f'{name} accuracy: {acc:.3f}')
+    return acc
+
+
+@torch.no_grad()
+def confusion_matrix(model, data_loader, transform=None, transfer_map=None, name=None, device='cuda'):
+    num_total = 0
+    num_correct = 0
+    model.eval()
+    model.to(device)
+    for x, y in data_loader:
+        x, y = x.to(device), y.to(device)
+        if transform is not None:
+            x = transform(x)
+        out = model(x)
+        predictions = out.argmax(dim=1)
+        correct = labels_correct(predictions, y, transfer_map=transfer_map)
+        num_correct += sum(correct)
+        num_total += len(correct)
+
+    acc = num_correct / num_total if num_total > 0 else 0   # this shouldn't happen
     if name is not None:
         print(f'{name} accuracy: {acc:.3f}')
     return acc
@@ -43,9 +88,15 @@ def transpose_dict(d):
 
 
 def pretty_plot(logs, steps_per_epoch=1, smoothing=0, save_loc=None):
+
+    max_len = max([len(v) for v in logs.values()])
+    dashed = [k for k, v in logs.items() if len(v) == 1]
+    logs = {k: v * max_len if len(v) == 1 else v for k, v in logs.items()}
+
     vals = torch.Tensor(list(logs.values()))
     if smoothing and len(vals) > smoothing:
-        vals = F.conv1d(vals.reshape((len(vals), 1, -1)), torch.ones((1, 1, smoothing)) / smoothing).squeeze()
+        vals = F.conv1d(vals.reshape((len(vals), 1, -1)),
+                        torch.ones((1, 1, smoothing)) / smoothing, padding='same').squeeze()
     y_max = max(vals.mean(dim=1) + vals.std(dim=1) * 1.5)
     x = torch.arange(vals.shape[1]) / steps_per_epoch
 
@@ -63,7 +114,8 @@ def pretty_plot(logs, steps_per_epoch=1, smoothing=0, save_loc=None):
         if 'acc' in m:
             values *= 100
             axis = scaled_axis
-        axis.plot(x, values, label=m, c=color_cycle[i])
+        axis.plot(x, values, label=m, c=color_cycle[i],
+                  linestyle='dashed' if m in dashed else None)
 
     legend = main_axis.legend(loc=2)
     legend.remove()
@@ -108,3 +160,33 @@ def calculate_mean_and_std(data_loader):
     std /= len(data_loader)
     print(f'mean: {mean}')
     print(f'std: {std}')
+
+
+def total_variation(x):
+    tv = ((x[:, :, :, :-1] - x[:, :, :, 1:]).norm()
+          + (x[:, :, :-1, :] - x[:, :, 1:, :]).norm()
+          + (x[:, :, 1:, :-1] - x[:, :, :-1, 1:]).norm()
+          + (x[:, :, :-1, :-1] - x[:, :, 1:, 1:]).norm())
+    return tv
+
+
+def dict_product(grid):
+    return [dict(zip(grid.keys(), v)) for v in product(*grid.values())]
+
+
+# def list_all_files(_dir):
+# files = sum([
+#     [
+#         os.path.join(root, file)
+#         for file in files
+#         if 'args.json' in file
+#     ]
+#     for root, dirs, files in os.walk(_di)
+# ], [])
+
+def clamp(x, _min, _max):
+    return max(min(_max, x), _min)
+
+
+def str2bool(x):
+    return False if x == '0' or x == 'False' or not x else True
